@@ -10,6 +10,7 @@ from tornado.httputil import (
     HTTPInputError,
     HTTPFile,
     ParseMultipartConfig,
+    ParseUrlEncodedConfig,
     ParseBodyConfig,
     parse_body_arguments,
     set_parse_body_config,
@@ -97,6 +98,65 @@ class QsParseTest(unittest.TestCase):
         self.assertIn(("a", "1"), qsl)
         self.assertIn(("a", "3"), qsl)
         self.assertIn(("b", "2"), qsl)
+
+
+class UrlEncodedDataTest(unittest.TestCase):
+    def test_urlencoded_data(self):
+        data = b"a=1&b=2&a=3"
+        args, files = form_data_args()
+        parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertEqual(args["a"], [b"1", b"3"])
+        self.assertEqual(args["b"], [b"2"])
+        self.assertEqual(files, {})
+
+    def test_max_arguments(self):
+        data = b"".join(b"a=1&" for _ in range(1001))
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_body_arguments("application/x-www-form-urlencoded", data, args, files)
+        self.assertIn("Max number of fields exceeded", str(cm.exception))
+
+    def test_max_arguments_config(self):
+        content_type = "application/x-www-form-urlencoded"
+
+        def make_body(num_args: int) -> bytes:
+            return b"&".join(b"a%d=1" % i for i in range(num_args))
+
+        # Exactly the default limit is accepted.
+        args, files = form_data_args()
+        parse_body_arguments(content_type, make_body(1000), args, files)
+        self.assertEqual(len(args), 1000)
+
+        # A body with a huge number of arguments is rejected without parsing.
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_body_arguments(content_type, make_body(100000), args, files)
+        self.assertIn("Max number of fields exceeded", str(cm.exception))
+        self.assertEqual(args, {})
+
+        # Per-call configuration.
+        config = ParseBodyConfig(urlencoded=ParseUrlEncodedConfig(max_arguments=5))
+        args, files = form_data_args()
+        parse_body_arguments(content_type, make_body(5), args, files, config=config)
+        self.assertEqual(len(args), 5)
+        args, files = form_data_args()
+        with self.assertRaises(HTTPInputError) as cm:
+            parse_body_arguments(
+                content_type, make_body(6), args, files, config=config
+            )
+        self.assertIn("Max number of fields exceeded", str(cm.exception))
+        self.assertEqual(args, {})
+
+        # Global configuration.
+        set_parse_body_config(
+            ParseBodyConfig(urlencoded=ParseUrlEncodedConfig(max_arguments=2000))
+        )
+        try:
+            args, files = form_data_args()
+            parse_body_arguments(content_type, make_body(1500), args, files)
+            self.assertEqual(len(args), 1500)
+        finally:
+            set_parse_body_config(ParseBodyConfig())
 
 
 class MultipartFormDataTest(unittest.TestCase):
@@ -431,6 +491,60 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
             )
         self.assertIn("Invalid content type", str(cm.exception))
         self.assertEqual(args, {})
+
+    def test_too_many_parts_split_is_bounded(self):
+        # A body with a huge number of parts must be rejected without first
+        # splitting it into one object per part (which would consume memory
+        # proportional to the number of parts, not the configured limit).
+        split_sizes = []  # type: List[int]
+
+        class RecordingBytes(bytes):
+            def __getitem__(self, key):
+                result = bytes.__getitem__(self, key)
+                if isinstance(key, slice):
+                    return RecordingBytes(result)
+                return result
+
+            def split(self, sep=None, maxsplit=-1):
+                result = bytes.split(self, sep, maxsplit)
+                split_sizes.append(len(result))
+                return result
+
+        body = RecordingBytes(
+            b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nv\r\n' * 10000
+            + b"--1234--\r\n"
+        )
+        for max_parts in (0, 1, 5, 100):
+            with self.subTest(max_parts=max_parts):
+                del split_sizes[:]
+                args, files = form_data_args()
+                with self.assertRaises(HTTPInputError) as cm:
+                    parse_multipart_form_data(
+                        b"1234",
+                        body,
+                        args,
+                        files,
+                        config=ParseMultipartConfig(max_parts=max_parts),
+                    )
+                self.assertIn("too many parts", str(cm.exception))
+                self.assertEqual(args, {})
+                self.assertEqual(len(split_sizes), 1)
+                self.assertLessEqual(split_sizes[0], max_parts + 2)
+
+        # Bodies within the limit are still parsed completely.
+        del split_sizes[:]
+        args, files = form_data_args()
+        parse_multipart_form_data(
+            b"1234",
+            RecordingBytes(
+                b'--1234\r\nContent-Disposition: form-data; name="a"\r\n\r\nv\r\n'
+                * 99
+                + b"--1234--\r\n"
+            ),
+            args,
+            files,
+        )
+        self.assertEqual(args, {"a": [b"v"] * 99})
 
     def test_malformed_body_raises_without_logging(self):
         # CVE-2025-47287: malformed bodies used to be logged (once per bad
